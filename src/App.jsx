@@ -1,62 +1,227 @@
 import React, { useState, useEffect, createContext, useContext } from 'react';
-import { Calendar, Star, Sparkles, Save, Edit3, X, ChevronLeft, ChevronRight, Filter, LogIn, LogOut } from 'lucide-react';
+import { Calendar, Star, Sparkles, Save, Edit3, X, ChevronLeft, ChevronRight, Filter, LogIn, LogOut, Copy, Check } from 'lucide-react';
 
-// Auth Context
+// ---------- Sync helpers ----------
+const SYNC_API = '/.netlify/functions/sync';
+
+function generateSyncCode() {
+  const words = ['sparkle', 'bubble', 'pixie', 'glimmer', 'dream', 'magic', 'stardust', 'glow', 'petal', 'confetti'];
+  const word = words[Math.floor(Math.random() * words.length)];
+  const rand = Math.random().toString(36).slice(2, 7);
+  return `bgb-${word}-${rand}`;
+}
+
+async function fetchRemoteEntries(code) {
+  const res = await fetch(`${SYNC_API}?code=${encodeURIComponent(code)}`);
+  if (!res.ok) throw new Error('Failed to fetch entries for that sync code');
+  const data = await res.json();
+  return data.entries || {};
+}
+
+async function pushRemoteEntries(code, entries) {
+  const res = await fetch(SYNC_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, entries }),
+  });
+  if (!res.ok) throw new Error('Failed to save entries');
+  return res.json();
+}
+
+// ---------- Auth Context ----------
 const AuthContext = createContext();
 
 function AuthProvider({ children }) {
   const [loggedIn, setLoggedIn] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
+  const [syncCode, setSyncCode] = useState(null);
+  const [newSyncCode, setNewSyncCode] = useState(null); // shown once, right after first-ever login on a device
 
   // Check for existing login on app start
   useEffect(() => {
     const savedUser = localStorage.getItem('bubblegumbytes_user');
-    if (savedUser) {
+    const savedCode = localStorage.getItem('bubblegumbytes_synccode');
+    if (savedUser && savedCode) {
       setCurrentUser(savedUser);
+      setSyncCode(savedCode);
       setLoggedIn(true);
     }
   }, []);
 
-  const login = (username) => {
-    setCurrentUser(username);
-    setLoggedIn(true);
+  // Normal username/password login.
+  // If this device has never had a sync code, mint one, migrate any legacy
+  // per-username local entries into it, and surface it once in a modal.
+  const loginWithPassword = async (username) => {
+    let code = localStorage.getItem('bubblegumbytes_synccode');
+    let isNewCode = false;
+
+    if (!code) {
+      code = generateSyncCode();
+      isNewCode = true;
+
+      const legacy = localStorage.getItem(`bubblegumbytes_entries_${username}`);
+      if (legacy) {
+        try {
+          await pushRemoteEntries(code, JSON.parse(legacy));
+        } catch (err) {
+          console.error('Could not migrate legacy entries:', err);
+        }
+      }
+    }
+
     localStorage.setItem('bubblegumbytes_user', username);
+    localStorage.setItem('bubblegumbytes_synccode', code);
+    setCurrentUser(username);
+    setSyncCode(code);
+    setLoggedIn(true);
+    if (isNewCode) setNewSyncCode(code);
+  };
+
+  // New-device login via an existing sync code.
+  const loginWithSyncCode = async (code, username) => {
+    localStorage.setItem('bubblegumbytes_user', username);
+    localStorage.setItem('bubblegumbytes_synccode', code);
+    setCurrentUser(username);
+    setSyncCode(code);
+    setLoggedIn(true);
   };
 
   const logout = () => {
     setLoggedIn(false);
     setCurrentUser(null);
+    setSyncCode(null);
     localStorage.removeItem('bubblegumbytes_user');
+    // Sync code stays saved on this device so logging back in here
+    // never asks for it again.
   };
-  
+
+  const dismissNewSyncCode = () => setNewSyncCode(null);
+
   return (
-    <AuthContext.Provider value={{ loggedIn, currentUser, login, logout }}>
+    <AuthContext.Provider
+      value={{
+        loggedIn,
+        currentUser,
+        syncCode,
+        newSyncCode,
+        loginWithPassword,
+        loginWithSyncCode,
+        logout,
+        dismissNewSyncCode,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
 }
 
+// ---------- New Sync Code Modal ----------
+function NewSyncCodeModal() {
+  const { newSyncCode, dismissNewSyncCode } = useContext(AuthContext);
+  const [confirmed, setConfirmed] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  if (!newSyncCode) return null;
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(newSyncCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard API unavailable — user can still select/copy manually
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+      <div className="bg-white/95 backdrop-blur-sm rounded-3xl max-w-md w-full p-8 shadow-2xl border-2 border-pink-200">
+        <div className="text-center mb-4">
+          <Sparkles className="mx-auto text-pink-500 mb-2" size={28} />
+          <h3 className="text-xl font-bold text-purple-800">Your Sync Code ✨</h3>
+          <p className="text-purple-600 text-sm mt-2">
+            Save this code! It's how you'll find your journal on other devices — like your phone or a friend's laptop.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 bg-gradient-to-br from-pink-50 to-purple-50 border-2 border-pink-200 rounded-2xl px-4 py-3 mb-4">
+          <code className="flex-1 text-purple-800 font-bold text-lg tracking-wide">{newSyncCode}</code>
+          <button
+            onClick={handleCopy}
+            className="p-2 rounded-full bg-white hover:bg-pink-100 border border-pink-200 transition-colors"
+            title="Copy code"
+          >
+            {copied ? <Check size={18} className="text-green-600" /> : <Copy size={18} className="text-purple-600" />}
+          </button>
+        </div>
+
+        <div className="bg-purple-50 border border-purple-200 rounded-2xl p-3 mb-4">
+          <p className="text-purple-600 text-xs">
+            There's no email or password reset tied to this — if you lose the code, that journal can't be recovered. Screenshot it or write it down somewhere safe.
+          </p>
+        </div>
+
+        <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={confirmed}
+            onChange={(e) => setConfirmed(e.target.checked)}
+            className="w-4 h-4 accent-pink-500"
+          />
+          <span className="text-sm text-purple-700">I've saved my sync code</span>
+        </label>
+
+        <button
+          onClick={dismissNewSyncCode}
+          disabled={!confirmed}
+          className="w-full bg-gradient-to-r from-pink-500 to-purple-500 text-white py-3 rounded-2xl font-bold transition-all duration-300 transform hover:scale-105 disabled:opacity-40 disabled:hover:scale-100"
+        >
+          Continue to My Journal ✨
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // SignIn Component
 function SignIn() {
+  const [mode, setMode] = useState('password'); // 'password' | 'synccode'
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [syncCodeInput, setSyncCodeInput] = useState('');
+  const [syncUsername, setSyncUsername] = useState('');
+  const [syncError, setSyncError] = useState('');
+  const [syncing, setSyncing] = useState(false);
   const [showConfetti, setShowConfetti] = useState(false);
-  const { login } = useContext(AuthContext);
+  const { loginWithPassword, loginWithSyncCode } = useContext(AuthContext);
 
   const handleLogin = () => {
-    console.log('Login clicked', { username, password }); // Debug log
-    
-    // Accept any non-empty username and password
     if (username && password) {
-      console.log('Login attempt with:', username); // Debug log
       setShowConfetti(true);
-      setTimeout(() => {
+      setTimeout(async () => {
         setShowConfetti(false);
-        login(username);
+        await loginWithPassword(username);
       }, 1500);
     } else {
-      console.log('Username or password empty'); // Debug log
       alert('Please enter both username and password');
+    }
+  };
+
+  const handleSyncLogin = async () => {
+    if (!syncCodeInput.trim() || !syncUsername.trim()) {
+      setSyncError('Enter your sync code and a username to continue.');
+      return;
+    }
+    setSyncing(true);
+    setSyncError('');
+    try {
+      await fetchRemoteEntries(syncCodeInput.trim()); // validates the code resolves
+      await loginWithSyncCode(syncCodeInput.trim(), syncUsername.trim());
+    } catch (err) {
+      console.error(err);
+      setSyncError("Couldn't find a journal with that code. Double-check it and try again.");
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -174,48 +339,110 @@ function SignIn() {
                 </span>
               </h1>
               <p className="text-purple-600 text-lg font-medium">Your magical digital diary ✨</p>
-              <p className="text-purple-500 text-sm mt-2">Enter your sparkly credentials to continue!</p>
+              <p className="text-purple-500 text-sm mt-2">
+                {mode === 'password' ? 'Enter your sparkly credentials to continue!' : 'Sync your journal onto this device!'}
+              </p>
             </div>
 
             {/* Login Form */}
             <div className="bg-white/90 backdrop-blur-sm rounded-3xl p-8 shadow-2xl border-2 border-pink-200">
-              <div className="space-y-6">
-                <div>
-                  <label className="block text-purple-700 font-semibold mb-2">
-                    Username ✨
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Enter your magical username..."
-                    value={username}
-                    onChange={e => setUsername(e.target.value)}
-                    className="w-full px-6 py-4 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-400 text-purple-800 font-medium"
-                  />
-                </div>
+              {mode === 'password' ? (
+                <div className="space-y-6">
+                  <div>
+                    <label className="block text-purple-700 font-semibold mb-2">
+                      Username ✨
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Enter your magical username..."
+                      value={username}
+                      onChange={e => setUsername(e.target.value)}
+                      className="w-full px-6 py-4 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-500 text-purple-800 font-medium"
+                    />
+                  </div>
 
-                <div>
-                  <label className="block text-purple-700 font-semibold mb-2">
-                    Password 🔐
-                  </label>
-                  <input
-                    type="password"
-                    placeholder="Enter your secret sparkle key..."
-                    value={password}
-                    onChange={e => setPassword(e.target.value)}
-                    onKeyPress={e => e.key === 'Enter' && handleLogin()}
-                    className="w-full px-6 py-4 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-400 text-purple-800 font-medium"
-                  />
-                </div>
+                  <div>
+                    <label className="block text-purple-700 font-semibold mb-2">
+                      Password 🔐
+                    </label>
+                    <input
+                      type="password"
+                      placeholder="Enter your secret sparkle key..."
+                      value={password}
+                      onChange={e => setPassword(e.target.value)}
+                      onKeyPress={e => e.key === 'Enter' && handleLogin()}
+                      className="w-full px-6 py-4 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-500 text-purple-800 font-medium"
+                    />
+                  </div>
 
-                <button
-                  onClick={handleLogin}
-                  className="w-full bg-gradient-to-r from-pink-500 to-purple-500 text-white py-4 rounded-2xl font-bold text-lg transition-all duration-300 transform hover:scale-105 hover:shadow-2xl active:scale-95 disabled:opacity-50"
-                  disabled={showConfetti}
-                >
-                  <LogIn className="inline mr-2" size={20} />
-                  {showConfetti ? 'Logging you in...' : 'Enter Your Magical World ✨'}
-                </button>
-              </div>
+                  <button
+                    onClick={handleLogin}
+                    className="w-full bg-gradient-to-r from-pink-500 to-purple-500 text-white py-4 rounded-2xl font-bold text-lg transition-all duration-300 transform hover:scale-105 hover:shadow-2xl active:scale-95 disabled:opacity-50"
+                    disabled={showConfetti}
+                  >
+                    <LogIn className="inline mr-2" size={20} />
+                    {showConfetti ? 'Logging you in...' : 'Enter Your Magical World ✨'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => { setMode('synccode'); setSyncError(''); }}
+                    className="w-full text-center text-purple-500 text-sm font-medium hover:text-purple-700 transition-colors underline underline-offset-2"
+                  >
+                    Already have a journal? Enter your sync code
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <div>
+                    <label className="block text-purple-700 font-semibold mb-2">
+                      Sync Code 🔗
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. bgb-sparkle-a1b2c"
+                      value={syncCodeInput}
+                      onChange={e => setSyncCodeInput(e.target.value)}
+                      className="w-full px-6 py-4 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-500 text-purple-800 font-medium"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-purple-700 font-semibold mb-2">
+                      Username ✨
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="What should we call you on this device?"
+                      value={syncUsername}
+                      onChange={e => setSyncUsername(e.target.value)}
+                      onKeyPress={e => e.key === 'Enter' && handleSyncLogin()}
+                      className="w-full px-6 py-4 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-500 text-purple-800 font-medium"
+                    />
+                  </div>
+
+                  {syncError && (
+                    <p className="text-red-500 text-sm font-medium text-center">{syncError}</p>
+                  )}
+
+                  <button
+                    onClick={handleSyncLogin}
+                    disabled={syncing}
+                    className="w-full bg-gradient-to-r from-pink-500 to-purple-500 text-white py-4 rounded-2xl font-bold text-lg transition-all duration-300 transform hover:scale-105 hover:shadow-2xl active:scale-95 disabled:opacity-50"
+                  >
+                    <LogIn className="inline mr-2" size={20} />
+                    {syncing ? 'Finding your journal...' : 'Sync My Journal ✨'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => { setMode('password'); setSyncError(''); }}
+                    className="w-full text-center text-purple-500 text-sm font-medium hover:text-purple-700 transition-colors underline underline-offset-2"
+                  >
+                    Back to username & password
+                  </button>
+                </div>
+              )}
 
               <div className="mt-6 p-4 bg-gradient-to-br from-purple-100 to-pink-100 rounded-2xl border border-purple-200">
                 <p className="text-center text-purple-700 text-sm">
@@ -249,8 +476,9 @@ function BubblegumBytes() {
   const [showEntryViewer, setShowEntryViewer] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
   const [moodFilter, setMoodFilter] = useState('');
-  
-  const { logout, currentUser } = useContext(AuthContext);
+  const [syncStatus, setSyncStatus] = useState('idle'); // idle | loading | saving | error
+
+  const { logout, currentUser, syncCode } = useContext(AuthContext);
 
   const affirmations = [
     "You are absolutely magical! ✨",
@@ -274,27 +502,47 @@ function BubblegumBytes() {
     { emoji: '🤔', label: 'Thoughtful', color: 'bg-yellow-200' }
   ];
 
-  // Load entries from localStorage on component mount
+  // On login: show a local cache instantly (snappy reload), then reconcile
+  // with the source of truth from the backend.
   useEffect(() => {
-    if (currentUser) {
-      const savedEntries = localStorage.getItem(`bubblegumbytes_entries_${currentUser}`);
-      if (savedEntries) {
-        try {
-          setEntries(JSON.parse(savedEntries));
-        } catch (error) {
-          console.error('Error loading entries:', error);
-          setEntries({});
-        }
+    if (!syncCode) return;
+
+    const cached = localStorage.getItem(`bubblegumbytes_entries_${syncCode}`);
+    if (cached) {
+      try {
+        setEntries(JSON.parse(cached));
+      } catch (error) {
+        console.error('Error loading cached entries:', error);
       }
     }
-  }, [currentUser]);
 
-  // Save entries to localStorage whenever entries change
+    setSyncStatus('loading');
+    fetchRemoteEntries(syncCode)
+      .then((remote) => {
+        setEntries(remote);
+        localStorage.setItem(`bubblegumbytes_entries_${syncCode}`, JSON.stringify(remote));
+        setSyncStatus('idle');
+      })
+      .catch((err) => {
+        console.error('Error fetching remote entries:', err);
+        setSyncStatus('error');
+      });
+  }, [syncCode]);
+
+  // Save entries locally (instant) and push to the backend (cross-device) on change.
   useEffect(() => {
-    if (currentUser && Object.keys(entries).length > 0) {
-      localStorage.setItem(`bubblegumbytes_entries_${currentUser}`, JSON.stringify(entries));
-    }
-  }, [entries, currentUser]);
+    if (!syncCode || Object.keys(entries).length === 0) return;
+
+    localStorage.setItem(`bubblegumbytes_entries_${syncCode}`, JSON.stringify(entries));
+
+    setSyncStatus('saving');
+    pushRemoteEntries(syncCode, entries)
+      .then(() => setSyncStatus('idle'))
+      .catch((err) => {
+        console.error('Error saving entries remotely:', err);
+        setSyncStatus('error');
+      });
+  }, [entries, syncCode]);
 
   const getFilteredEntries = () => {
     const entriesArray = Object.values(entries)
@@ -567,6 +815,12 @@ function BubblegumBytes() {
           <header className="text-center py-8 relative">
             <div className="absolute top-0 right-4 md:right-8 flex items-center space-x-4">
               <span className="text-purple-600 font-medium">Hello, {currentUser}! 👋🏾</span>
+              {syncStatus === 'saving' && (
+                <span className="text-purple-400 text-xs hidden md:inline">Saving...</span>
+              )}
+              {syncStatus === 'error' && (
+                <span className="text-red-400 text-xs hidden md:inline">Sync issue — saved on this device</span>
+              )}
               <button
                 onClick={logout}
                 className="bg-white/80 backdrop-blur-sm hover:bg-white/90 text-purple-600 px-4 py-2 rounded-full font-medium border-2 border-pink-200 hover:border-pink-300 transition-all duration-300 transform hover:scale-105 shadow-lg"
@@ -676,7 +930,7 @@ function BubblegumBytes() {
                       value={currentEntry}
                       onChange={(e) => setCurrentEntry(e.target.value)}
                       placeholder="What's on your mind today? ✨"
-                      className="w-full h-64 p-6 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none resize-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-400 text-purple-800 font-medium"
+                      className="w-full h-64 p-6 rounded-2xl border-2 border-pink-200 focus:border-pink-400 outline-none resize-none bg-gradient-to-br from-pink-50 to-purple-50 placeholder-purple-500 text-purple-800 font-medium"
                     />
 
                     <button
@@ -704,10 +958,6 @@ function BubblegumBytes() {
                       <div className="flex justify-between items-center">
                         <span className="text-purple-600">Total Entries:</span>
                         <span className="font-bold text-pink-600">{Object.keys(entries).length}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                        <span className="text-purple-600">Current Streak:</span>
-                        <span className="font-bold text-pink-600">✨ Amazing!</span>
                       </div>
                       {Object.keys(entries).length > 0 && (
                         <button
@@ -792,8 +1042,13 @@ function BubblegumBytes() {
 // Main App Component
 function App() {
   const { loggedIn } = useContext(AuthContext);
-  
-  return loggedIn ? <BubblegumBytes /> : <SignIn />;
+
+  return (
+    <>
+      {loggedIn ? <BubblegumBytes /> : <SignIn />}
+      <NewSyncCodeModal />
+    </>
+  );
 }
 
 // Export with AuthProvider wrapper
