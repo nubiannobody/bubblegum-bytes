@@ -472,11 +472,12 @@ function BubblegumBytes() {
   const [entries, setEntries] = useState({});
   const [selectedMood, setSelectedMood] = useState('');
   const [showConfetti, setShowConfetti] = useState(false);
-  const [currentView, setCurrentView] = useState('write');
+  const [currentView, setCurrentView] = useState('landing');
   const [showEntryViewer, setShowEntryViewer] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
   const [moodFilter, setMoodFilter] = useState('');
   const [syncStatus, setSyncStatus] = useState('idle'); // idle | loading | saving | error
+  const [savedEntryDate, setSavedEntryDate] = useState(null); // which entry to reference on the "Entry Saved" screen
 
   const { logout, currentUser, syncCode } = useContext(AuthContext);
 
@@ -491,6 +492,18 @@ function BubblegumBytes() {
   ];
 
   const [dailyAffirmation] = useState(affirmations[Math.floor(Math.random() * affirmations.length)]);
+
+  const moodSendOffs = {
+    Happy: "Your joy is safely tucked away ✨ Carry a little of it with you today!",
+    Excited: "That excitement is written in the stars now 🌟 Go chase what lights you up!",
+    Peaceful: "That peace is safely kept 🌙 Have a gentle rest of your day.",
+    Grateful: "That gratitude is written in the stars now 🌙 Have a gentle rest of your day.",
+    Sleepy: "Rest easy — your thoughts are safe and sound. Sweet dreams later ✨",
+    Frustrated: "You let it out, and that matters. Be kind to yourself for the rest of today 💜",
+    Thoughtful: "Your reflections are safely kept ✨ Carry that clarity with you.",
+  };
+
+  const getSendOffMessage = (mood) => moodSendOffs[mood] || "Your thoughts are safe. Go be magical. ✨";
 
   const moods = [
     { emoji: '😊', label: 'Happy', color: 'bg-pink-200' },
@@ -557,16 +570,10 @@ function BubblegumBytes() {
 
   const filteredEntries = getFilteredEntries();
 
-  useEffect(() => {
-    const entry = entries[selectedDate];
-    if (entry) {
-      setCurrentEntry(entry.text || '');
-      setSelectedMood(entry.mood || '');
-    } else {
-      setCurrentEntry('');
-      setSelectedMood('');
-    }
-  }, [selectedDate, entries]);
+  // Note: entries are only ever loaded into the Write form via an explicit
+  // action (editEntry, handleDateChange, createEntryForDate) — never just
+  // because selectedDate happens to match an existing entry. That's what
+  // keeps "Create New Entry" a true blank slate.
 
   const saveEntry = () => {
     if (currentEntry.trim() || selectedMood) {
@@ -582,9 +589,46 @@ function BubblegumBytes() {
         [selectedDate]: newEntry
       }));
 
+      setSavedEntryDate(selectedDate);
       setShowConfetti(true);
       setTimeout(() => setShowConfetti(false), 2000);
+      setCurrentView('saved');
     }
+  };
+
+  const startNewEntry = () => {
+    setCurrentEntry('');
+    setSelectedMood('');
+    setSelectedDate(new Date().toISOString().split('T')[0]);
+    setCurrentView('write');
+  };
+
+  // Explicit date change within the Write form (e.g. via the date picker) —
+  // this is an intentional "load this day" action, so it's okay to pull in
+  // whatever's already saved there.
+  const handleDateChange = (newDate) => {
+    setSelectedDate(newDate);
+    const entry = entries[newDate];
+    setCurrentEntry(entry?.text || '');
+    setSelectedMood(entry?.mood || '');
+  };
+
+  // Explicit "Edit Entry" action from the Calendar screen.
+  const editEntry = (date) => {
+    const entry = entries[date];
+    setSelectedDate(date);
+    setCurrentEntry(entry?.text || '');
+    setSelectedMood(entry?.mood || '');
+    setCurrentView('write');
+  };
+
+  // Explicit "Create Entry" action from the Calendar screen — blank slate
+  // for that specific date.
+  const createEntryForDate = (date) => {
+    setSelectedDate(date);
+    setCurrentEntry('');
+    setSelectedMood('');
+    setCurrentView('write');
   };
 
   const openEntryViewer = (entryDate = null) => {
@@ -861,38 +905,52 @@ function BubblegumBytes() {
             <p className="text-purple-600 text-lg mt-4 font-medium">Your magical digital diary ✨</p>
           </header>
 
-          {/* Navigation */}
-          <nav className="flex justify-center mb-8">
-            <div className="bg-white/80 backdrop-blur-sm rounded-full p-2 shadow-lg border-2 border-pink-200">
-              <div className="flex space-x-2">
-                <button
-                  onClick={() => setCurrentView('write')}
-                  className={`px-6 py-3 rounded-full font-medium transition-all duration-300 transform hover:scale-105 ${
-                    currentView === 'write'
-                      ? 'bg-gradient-to-r from-pink-400 to-purple-400 text-white shadow-lg'
-                      : 'text-purple-600 hover:bg-purple-100'
-                  }`}
-                >
-                  <Edit3 className="inline mr-2" size={16} />
-                  Write
-                </button>
-                <button
-                  onClick={() => setCurrentView('calendar')}
-                  className={`px-6 py-3 rounded-full font-medium transition-all duration-300 transform hover:scale-105 ${
-                    currentView === 'calendar'
-                      ? 'bg-gradient-to-r from-pink-400 to-purple-400 text-white shadow-lg'
-                      : 'text-purple-600 hover:bg-purple-100'
-                  }`}
-                >
-                  <Calendar className="inline mr-2" size={16} />
-                  Calendar
-                </button>
-              </div>
+          {/* Back to Home */}
+          {(currentView === 'write' || currentView === 'calendar') && (
+            <div className="flex justify-center mb-8">
+              <button
+                onClick={() => setCurrentView('landing')}
+                className="flex items-center gap-2 text-purple-600 font-medium hover:text-purple-800 transition-colors bg-white/80 backdrop-blur-sm px-5 py-2 rounded-full border-2 border-pink-200 hover:border-pink-300 shadow-md transform hover:scale-105 duration-300"
+              >
+                <ChevronLeft size={18} />
+                Back to Home
+              </button>
             </div>
-          </nav>
+          )}
 
           <div className="max-w-4xl mx-auto px-4">
-            {currentView === 'write' ? (
+            {currentView === 'landing' ? (
+              <div className="max-w-lg mx-auto">
+                <div className="bg-white/90 backdrop-blur-sm rounded-3xl p-10 shadow-2xl border-2 border-pink-200 text-center">
+                  <Sparkles className="mx-auto text-pink-500 mb-4" size={32} />
+                  <h2 className="text-2xl font-bold text-purple-800 mb-2">Hello, {currentUser}! 👋</h2>
+                  <p className="text-purple-600 font-medium mb-8">{dailyAffirmation}</p>
+
+                  <div className="space-y-3">
+                    <button
+                      onClick={startNewEntry}
+                      className="w-full bg-gradient-to-r from-pink-500 to-purple-500 text-white py-4 rounded-2xl font-bold text-lg transition-all duration-300 transform hover:scale-105 hover:shadow-2xl active:scale-95"
+                    >
+                      <Edit3 className="inline mr-2" size={20} />
+                      Create New Entry
+                    </button>
+                    <button
+                      onClick={() => setCurrentView('calendar')}
+                      className="w-full bg-white text-purple-600 py-4 rounded-2xl font-bold text-lg border-2 border-pink-200 hover:border-pink-300 hover:bg-pink-50 transition-all duration-300 transform hover:scale-105"
+                    >
+                      <Calendar className="inline mr-2" size={20} />
+                      View Calendar
+                    </button>
+                  </div>
+
+                  {Object.keys(entries).length > 0 && (
+                    <p className="text-purple-400 text-sm mt-6">
+                      You've written {Object.keys(entries).length} {Object.keys(entries).length === 1 ? 'entry' : 'entries'} so far ✨
+                    </p>
+                  )}
+                </div>
+              </div>
+            ) : currentView === 'write' ? (
               <div className="grid md:grid-cols-3 gap-8">
                 <div className="md:col-span-2">
                   <div className="bg-white/90 backdrop-blur-sm rounded-3xl p-8 shadow-2xl border-2 border-pink-200">
@@ -901,7 +959,7 @@ function BubblegumBytes() {
                       <input
                         type="date"
                         value={selectedDate}
-                        onChange={(e) => setSelectedDate(e.target.value)}
+                        onChange={(e) => handleDateChange(e.target.value)}
                         className="px-4 py-2 rounded-full border-2 border-pink-200 focus:border-pink-400 outline-none bg-pink-50"
                       />
                     </div>
@@ -971,9 +1029,63 @@ function BubblegumBytes() {
                   </div>
                 </div>
               </div>
+            ) : currentView === 'saved' ? (
+              <div className="max-w-lg mx-auto">
+                <div className="bg-white/90 backdrop-blur-sm rounded-3xl p-10 shadow-2xl border-2 border-pink-200 text-center">
+                  <div className="text-5xl mb-4">
+                    {entries[savedEntryDate]?.mood
+                      ? moods.find(m => m.label === entries[savedEntryDate].mood)?.emoji
+                      : '✨'}
+                  </div>
+                  <h2 className="text-2xl font-bold text-purple-800 mb-3">Entry Saved!</h2>
+                  <p className="text-purple-600 font-medium mb-8 leading-relaxed">
+                    {getSendOffMessage(entries[savedEntryDate]?.mood)}
+                  </p>
+
+                  <div className="space-y-3">
+                    <button
+                      onClick={startNewEntry}
+                      className="w-full bg-gradient-to-r from-pink-500 to-purple-500 text-white py-4 rounded-2xl font-bold text-lg transition-all duration-300 transform hover:scale-105 hover:shadow-2xl active:scale-95"
+                    >
+                      <Edit3 className="inline mr-2" size={20} />
+                      Create New Entry
+                    </button>
+                    <button
+                      onClick={() => setCurrentView('calendar')}
+                      className="w-full bg-white text-purple-600 py-4 rounded-2xl font-bold text-lg border-2 border-pink-200 hover:border-pink-300 hover:bg-pink-50 transition-all duration-300 transform hover:scale-105"
+                    >
+                      <Calendar className="inline mr-2" size={20} />
+                      View Calendar
+                    </button>
+                    <button
+                      onClick={() => openEntryViewer(savedEntryDate)}
+                      className="w-full text-purple-500 py-2 font-medium hover:text-purple-700 transition-colors underline underline-offset-2"
+                    >
+                      Review This Entry 📖
+                    </button>
+                  </div>
+
+                  <button
+                    onClick={() => setCurrentView('landing')}
+                    className="mt-6 text-purple-400 text-sm hover:text-purple-600 transition-colors"
+                  >
+                    ← Back to Home
+                  </button>
+                </div>
+              </div>
             ) : (
               <div className="bg-white/90 backdrop-blur-sm rounded-3xl p-8 shadow-2xl border-2 border-pink-200 max-w-2xl mx-auto">
-                <h2 className="text-3xl font-bold text-purple-700 text-center mb-6">{currentMonth} Calendar</h2>
+                <h2 className="text-3xl font-bold text-purple-700 text-center mb-2">{currentMonth} Calendar</h2>
+                {Object.keys(entries).length > 0 && (
+                  <div className="text-center mb-6">
+                    <button
+                      onClick={() => openEntryViewer()}
+                      className="text-purple-500 font-medium hover:text-purple-700 transition-colors underline underline-offset-2"
+                    >
+                      View All Entries 📖
+                    </button>
+                  </div>
+                )}
                 
                 <div className="grid grid-cols-7 gap-2 mb-4">
                   {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
@@ -1022,12 +1134,25 @@ function BubblegumBytes() {
                         View Entry
                       </button>
                       <button
-                        onClick={() => setCurrentView('write')}
+                        onClick={() => editEntry(selectedDate)}
                         className="px-4 py-2 bg-pink-400 text-white rounded-full font-medium hover:bg-pink-500 transition-colors"
                       >
                         Edit Entry
                       </button>
                     </div>
+                  </div>
+                )}
+
+                {!entries[selectedDate] && (
+                  <div className="mt-6 p-6 bg-gradient-to-br from-pink-50 to-purple-50 rounded-2xl border-2 border-dashed border-pink-300 text-center">
+                    <p className="text-purple-600 font-medium mb-4">No entry yet for {selectedDate} ✨</p>
+                    <button
+                      onClick={() => createEntryForDate(selectedDate)}
+                      className="px-6 py-2 bg-gradient-to-r from-pink-500 to-purple-500 text-white rounded-full font-medium hover:scale-105 transition-transform"
+                    >
+                      <Edit3 className="inline mr-2" size={16} />
+                      Create Entry
+                    </button>
                   </div>
                 )}
               </div>
