@@ -1,4 +1,4 @@
-import React, { useState, useEffect, createContext, useContext } from 'react';
+import React, { useState, useEffect, useRef, createContext, useContext } from 'react';
 import { Calendar, Star, Sparkles, Save, Edit3, X, ChevronLeft, ChevronRight, Filter, LogIn, LogOut, Copy, Check } from 'lucide-react';
 
 // ---------- Sync helpers ----------
@@ -26,6 +26,41 @@ async function pushRemoteEntries(code, entries) {
   });
   if (!res.ok) throw new Error('Failed to save entries');
   return res.json();
+}
+
+function generateEntryId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return `entry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Converts data into { [date]: Entry[] }. Handles both the current shape
+// and the older shape where each date held a single entry object directly
+// (from before multiple entries per day were supported), so nobody's old
+// journal entries get dropped.
+function migrateEntries(raw) {
+  const migrated = {};
+  Object.entries(raw || {}).forEach(([date, value]) => {
+    if (Array.isArray(value)) {
+      migrated[date] = value.map((e) => ({
+        id: e.id || generateEntryId(),
+        text: e.text || '',
+        mood: e.mood || '',
+        date: e.date || date,
+        user: e.user,
+        createdAt: e.createdAt || `${date}T12:00:00.000Z`,
+      }));
+    } else if (value && (value.text || value.mood)) {
+      migrated[date] = [{
+        id: generateEntryId(),
+        text: value.text || '',
+        mood: value.mood || '',
+        date: value.date || date,
+        user: value.user,
+        createdAt: `${date}T12:00:00.000Z`,
+      }];
+    }
+  });
+  return migrated;
 }
 
 // ---------- Auth Context ----------
@@ -477,7 +512,9 @@ function BubblegumBytes() {
   const [viewerIndex, setViewerIndex] = useState(0);
   const [moodFilter, setMoodFilter] = useState('');
   const [syncStatus, setSyncStatus] = useState('idle'); // idle | loading | saving | error
-  const [savedEntryDate, setSavedEntryDate] = useState(null); // which entry to reference on the "Entry Saved" screen
+  const [savedEntryDate, setSavedEntryDate] = useState(null); // which date to reference on the "Entry Saved" screen
+  const [savedEntryId, setSavedEntryId] = useState(null); // which specific entry was just saved
+  const [editingEntryId, setEditingEntryId] = useState(null); // null = writing a new entry; set = updating an existing one in place
 
   const { logout, currentUser, syncCode } = useContext(AuthContext);
 
@@ -516,14 +553,25 @@ function BubblegumBytes() {
   ];
 
   // On login: show a local cache instantly (snappy reload), then reconcile
-  // with the source of truth from the backend.
+  // with the source of truth from the backend. Both passes run through
+  // migrateEntries() so anyone with old-format (one entry per day) data
+  // gets it upgraded to the new array-per-day format automatically.
+  //
+  // hasHydratedRef guards against a race: loading the cached copy updates
+  // `entries`, which the save-effect below is watching. Without this guard,
+  // that cached-copy load could trigger a push to the backend BEFORE the
+  // real fetch from the server finishes — overwriting server data with a
+  // possibly-stale local snapshot. Nothing pushes until hydration completes.
+  const hasHydratedRef = useRef(false);
+
   useEffect(() => {
     if (!syncCode) return;
+    hasHydratedRef.current = false;
 
     const cached = localStorage.getItem(`bubblegumbytes_entries_${syncCode}`);
     if (cached) {
       try {
-        setEntries(JSON.parse(cached));
+        setEntries(migrateEntries(JSON.parse(cached)));
       } catch (error) {
         console.error('Error loading cached entries:', error);
       }
@@ -532,19 +580,23 @@ function BubblegumBytes() {
     setSyncStatus('loading');
     fetchRemoteEntries(syncCode)
       .then((remote) => {
-        setEntries(remote);
-        localStorage.setItem(`bubblegumbytes_entries_${syncCode}`, JSON.stringify(remote));
+        const migrated = migrateEntries(remote);
+        setEntries(migrated);
+        localStorage.setItem(`bubblegumbytes_entries_${syncCode}`, JSON.stringify(migrated));
         setSyncStatus('idle');
       })
       .catch((err) => {
         console.error('Error fetching remote entries:', err);
         setSyncStatus('error');
+      })
+      .finally(() => {
+        hasHydratedRef.current = true;
       });
   }, [syncCode]);
 
   // Save entries locally (instant) and push to the backend (cross-device) on change.
   useEffect(() => {
-    if (!syncCode || Object.keys(entries).length === 0) return;
+    if (!syncCode || !hasHydratedRef.current || Object.keys(entries).length === 0) return;
 
     localStorage.setItem(`bubblegumbytes_entries_${syncCode}`, JSON.stringify(entries));
 
@@ -559,9 +611,10 @@ function BubblegumBytes() {
 
   const getFilteredEntries = () => {
     const entriesArray = Object.values(entries)
+      .flat()
       .filter(entry => entry.text || entry.mood)
-      .sort((a, b) => new Date(b.date) - new Date(a.date));
-    
+      .sort((a, b) => new Date(b.createdAt || b.date) - new Date(a.createdAt || a.date));
+
     if (moodFilter) {
       return entriesArray.filter(entry => entry.mood === moodFilter);
     }
@@ -571,72 +624,89 @@ function BubblegumBytes() {
   const filteredEntries = getFilteredEntries();
 
   // Note: entries are only ever loaded into the Write form via an explicit
-  // action (editEntry, handleDateChange, createEntryForDate) — never just
+  // action (editEntry, createEntryForDate, startNewEntry) — never just
   // because selectedDate happens to match an existing entry. That's what
-  // keeps "Create New Entry" a true blank slate.
+  // keeps "Create New Entry" a true blank slate, and it's also what lets
+  // multiple entries share the same date without one overwriting another.
 
   const saveEntry = () => {
-    if (currentEntry.trim() || selectedMood) {
-      const newEntry = {
-        text: currentEntry,
-        mood: selectedMood,
-        date: selectedDate,
-        user: currentUser
-      };
+    if (!currentEntry.trim() && !selectedMood) return;
 
-      setEntries(prev => ({
-        ...prev,
-        [selectedDate]: newEntry
-      }));
+    const entryId = editingEntryId || generateEntryId();
+    const existing = editingEntryId
+      ? (entries[selectedDate] || []).find(e => e.id === editingEntryId)
+      : null;
 
-      setSavedEntryDate(selectedDate);
-      setShowConfetti(true);
-      setTimeout(() => setShowConfetti(false), 2000);
-      setCurrentView('saved');
-    }
+    const entryPayload = {
+      id: entryId,
+      text: currentEntry,
+      mood: selectedMood,
+      date: selectedDate,
+      user: currentUser,
+      createdAt: existing?.createdAt || new Date().toISOString(),
+    };
+
+    setEntries(prev => {
+      const dayEntries = prev[selectedDate] || [];
+      const alreadyThere = dayEntries.some(e => e.id === entryId);
+      const updatedDayEntries = alreadyThere
+        ? dayEntries.map(e => (e.id === entryId ? entryPayload : e))
+        : [...dayEntries, entryPayload];
+      return { ...prev, [selectedDate]: updatedDayEntries };
+    });
+
+    setSavedEntryDate(selectedDate);
+    setSavedEntryId(entryId);
+    setEditingEntryId(null);
+    setShowConfetti(true);
+    setTimeout(() => setShowConfetti(false), 2000);
+    setCurrentView('saved');
   };
 
   const startNewEntry = () => {
     setCurrentEntry('');
     setSelectedMood('');
     setSelectedDate(new Date().toISOString().split('T')[0]);
+    setEditingEntryId(null);
     setCurrentView('write');
   };
 
-  // Explicit date change within the Write form (e.g. via the date picker) —
-  // this is an intentional "load this day" action, so it's okay to pull in
-  // whatever's already saved there.
+  // Explicit date change within the Write form (e.g. via the date picker).
+  // Since a date can now hold several entries, changing the date always
+  // starts a fresh entry for that day rather than guessing which existing
+  // one to load — loading a specific entry happens via editEntry() instead.
   const handleDateChange = (newDate) => {
     setSelectedDate(newDate);
-    const entry = entries[newDate];
-    setCurrentEntry(entry?.text || '');
-    setSelectedMood(entry?.mood || '');
+    setCurrentEntry('');
+    setSelectedMood('');
+    setEditingEntryId(null);
   };
 
-  // Explicit "Edit Entry" action from the Calendar screen.
-  const editEntry = (date) => {
-    const entry = entries[date];
-    setSelectedDate(date);
-    setCurrentEntry(entry?.text || '');
-    setSelectedMood(entry?.mood || '');
+  // Explicit "Edit" action on a specific entry (from the Calendar screen).
+  const editEntry = (entry) => {
+    setSelectedDate(entry.date);
+    setCurrentEntry(entry.text || '');
+    setSelectedMood(entry.mood || '');
+    setEditingEntryId(entry.id);
     setCurrentView('write');
   };
 
-  // Explicit "Create Entry" action from the Calendar screen — blank slate
-  // for that specific date.
+  // Explicit "Create Entry" / "Add Another" action from the Calendar screen
+  // — blank slate for that specific date.
   const createEntryForDate = (date) => {
     setSelectedDate(date);
     setCurrentEntry('');
     setSelectedMood('');
+    setEditingEntryId(null);
     setCurrentView('write');
   };
 
-  const openEntryViewer = (entryDate = null) => {
-    const entries = getFilteredEntries();
-    if (entries.length === 0) return;
-    
-    if (entryDate) {
-      const index = entries.findIndex(entry => entry.date === entryDate);
+  const openEntryViewer = (entryId = null) => {
+    const list = getFilteredEntries();
+    if (list.length === 0) return;
+
+    if (entryId) {
+      const index = list.findIndex(entry => entry.id === entryId);
       setViewerIndex(index >= 0 ? index : 0);
     } else {
       setViewerIndex(0);
@@ -661,10 +731,12 @@ function BubblegumBytes() {
     
     for (let day = 1; day <= daysInMonth; day++) {
       const dateStr = `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const dayEntryCount = (entries[dateStr] || []).filter(e => e.text || e.mood).length;
       days.push({
         day,
         dateStr,
-        hasEntry: entries[dateStr] && (entries[dateStr].text || entries[dateStr].mood)
+        hasEntry: dayEntryCount > 0,
+        entryCount: dayEntryCount,
       });
     }
     
@@ -672,6 +744,7 @@ function BubblegumBytes() {
   };
 
   const calendarDays = generateCalendarDays();
+  const totalEntryCount = Object.values(entries).flat().filter(e => e.text || e.mood).length;
   const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
   const currentMonth = monthNames[new Date().getMonth()];
 
@@ -791,14 +864,21 @@ function BubblegumBytes() {
                 {filteredEntries[viewerIndex] && (
                   <div className="space-y-4">
                     <div className="flex justify-between items-center">
-                      <h4 className="text-lg font-semibold text-purple-800">
-                        {new Date(filteredEntries[viewerIndex].date).toLocaleDateString('en-US', {
-                          weekday: 'long',
-                          year: 'numeric',
-                          month: 'long',
-                          day: 'numeric'
-                        })}
-                      </h4>
+                      <div>
+                        <h4 className="text-lg font-semibold text-purple-800">
+                          {new Date(filteredEntries[viewerIndex].date).toLocaleDateString('en-US', {
+                            weekday: 'long',
+                            year: 'numeric',
+                            month: 'long',
+                            day: 'numeric'
+                          })}
+                        </h4>
+                        {filteredEntries[viewerIndex].createdAt && (
+                          <p className="text-purple-400 text-xs mt-1">
+                            {new Date(filteredEntries[viewerIndex].createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                          </p>
+                        )}
+                      </div>
                       {filteredEntries[viewerIndex].mood && (
                         <span className="px-3 py-1 bg-pink-200 text-purple-800 rounded-full text-sm font-medium">
                           {moods.find(m => m.label === filteredEntries[viewerIndex].mood)?.emoji} {filteredEntries[viewerIndex].mood}
@@ -943,9 +1023,9 @@ function BubblegumBytes() {
                     </button>
                   </div>
 
-                  {Object.keys(entries).length > 0 && (
+                  {totalEntryCount > 0 && (
                     <p className="text-purple-400 text-sm mt-6">
-                      You've written {Object.keys(entries).length} {Object.keys(entries).length === 1 ? 'entry' : 'entries'} so far ✨
+                      You've written {totalEntryCount} {totalEntryCount === 1 ? 'entry' : 'entries'} so far ✨
                     </p>
                   )}
                 </div>
@@ -955,7 +1035,9 @@ function BubblegumBytes() {
                 <div className="md:col-span-2">
                   <div className="bg-white/90 backdrop-blur-sm rounded-3xl p-8 shadow-2xl border-2 border-pink-200">
                     <div className="flex justify-between items-center mb-6">
-                      <h2 className="text-2xl font-bold text-purple-700">Today's Entry</h2>
+                      <h2 className="text-2xl font-bold text-purple-700">
+                        {editingEntryId ? 'Editing Entry' : 'New Entry'}
+                      </h2>
                       <input
                         type="date"
                         value={selectedDate}
@@ -996,7 +1078,7 @@ function BubblegumBytes() {
                       className="mt-6 w-full bg-gradient-to-r from-pink-500 to-purple-500 text-white py-4 rounded-2xl font-bold text-lg transition-all duration-300 transform hover:scale-105 hover:shadow-2xl active:scale-95"
                     >
                       <Save className="inline mr-2" size={20} />
-                      Save My Thoughts ✨
+                      {editingEntryId ? 'Save Changes ✨' : 'Save My Thoughts ✨'}
                     </button>
                   </div>
                 </div>
@@ -1015,9 +1097,9 @@ function BubblegumBytes() {
                     <div className="space-y-3">
                       <div className="flex justify-between items-center">
                         <span className="text-purple-600">Total Entries:</span>
-                        <span className="font-bold text-pink-600">{Object.keys(entries).length}</span>
+                        <span className="font-bold text-pink-600">{totalEntryCount}</span>
                       </div>
-                      {Object.keys(entries).length > 0 && (
+                      {totalEntryCount > 0 && (
                         <button
                           onClick={() => openEntryViewer()}
                           className="w-full mt-4 bg-gradient-to-r from-purple-400 to-pink-400 text-white py-2 rounded-full font-medium hover:scale-105 transition-transform"
@@ -1058,7 +1140,7 @@ function BubblegumBytes() {
                       View Calendar
                     </button>
                     <button
-                      onClick={() => openEntryViewer(savedEntryDate)}
+                      onClick={() => openEntryViewer(savedEntryId)}
                       className="w-full text-purple-500 py-2 font-medium hover:text-purple-700 transition-colors underline underline-offset-2"
                     >
                       Review This Entry 📖
@@ -1076,7 +1158,7 @@ function BubblegumBytes() {
             ) : (
               <div className="bg-white/90 backdrop-blur-sm rounded-3xl p-8 shadow-2xl border-2 border-pink-200 max-w-2xl mx-auto">
                 <h2 className="text-3xl font-bold text-purple-700 text-center mb-2">{currentMonth} Calendar</h2>
-                {Object.keys(entries).length > 0 && (
+                {totalEntryCount > 0 && (
                   <div className="text-center mb-6">
                     <button
                       onClick={() => openEntryViewer()}
@@ -1110,40 +1192,65 @@ function BubblegumBytes() {
                       disabled={!day}
                     >
                       {day?.day}
-                      {day?.hasEntry && <div className="text-xs">✨</div>}
+                      {day?.hasEntry && (
+                        <div className="text-xs">{day.entryCount > 1 ? `✨×${day.entryCount}` : '✨'}</div>
+                      )}
                     </button>
                   ))}
                 </div>
 
-                {entries[selectedDate] && (
-                  <div className="mt-6 p-6 bg-gradient-to-br from-pink-50 to-purple-50 rounded-2xl border-2 border-pink-200">
-                    <div className="flex justify-between items-center mb-4">
-                      <h3 className="font-bold text-purple-800">Entry for {selectedDate}</h3>
-                      {entries[selectedDate].mood && (
-                        <span className="px-3 py-1 bg-pink-200 text-purple-800 rounded-full text-sm font-medium">
-                          {moods.find(m => m.label === entries[selectedDate].mood)?.emoji} {entries[selectedDate].mood}
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-purple-700 line-clamp-3">{entries[selectedDate].text}</p>
-                    <div className="mt-4 flex space-x-3">
+                {entries[selectedDate] && entries[selectedDate].length > 0 && (
+                  <div className="mt-6 space-y-4">
+                    <div className="flex justify-between items-center">
+                      <h3 className="font-bold text-purple-800">
+                        {entries[selectedDate].length} {entries[selectedDate].length === 1 ? 'Entry' : 'Entries'} for {selectedDate}
+                      </h3>
                       <button
-                        onClick={() => openEntryViewer(selectedDate)}
-                        className="px-4 py-2 bg-purple-400 text-white rounded-full font-medium hover:bg-purple-500 transition-colors"
+                        onClick={() => createEntryForDate(selectedDate)}
+                        className="text-sm px-4 py-2 bg-gradient-to-r from-pink-500 to-purple-500 text-white rounded-full font-medium hover:scale-105 transition-transform"
                       >
-                        View Entry
-                      </button>
-                      <button
-                        onClick={() => editEntry(selectedDate)}
-                        className="px-4 py-2 bg-pink-400 text-white rounded-full font-medium hover:bg-pink-500 transition-colors"
-                      >
-                        Edit Entry
+                        + Add Another
                       </button>
                     </div>
+
+                    {entries[selectedDate]
+                      .slice()
+                      .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0))
+                      .map((entry) => (
+                        <div key={entry.id} className="p-5 bg-gradient-to-br from-pink-50 to-purple-50 rounded-2xl border-2 border-pink-200">
+                          <div className="flex justify-between items-center mb-2">
+                            <span className="text-purple-400 text-xs font-medium">
+                              {entry.createdAt
+                                ? new Date(entry.createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+                                : ''}
+                            </span>
+                            {entry.mood && (
+                              <span className="px-3 py-1 bg-pink-200 text-purple-800 rounded-full text-sm font-medium">
+                                {moods.find(m => m.label === entry.mood)?.emoji} {entry.mood}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-purple-700 line-clamp-3">{entry.text}</p>
+                          <div className="mt-3 flex space-x-3">
+                            <button
+                              onClick={() => openEntryViewer(entry.id)}
+                              className="px-4 py-2 bg-purple-400 text-white rounded-full font-medium hover:bg-purple-500 transition-colors text-sm"
+                            >
+                              View
+                            </button>
+                            <button
+                              onClick={() => editEntry(entry)}
+                              className="px-4 py-2 bg-pink-400 text-white rounded-full font-medium hover:bg-pink-500 transition-colors text-sm"
+                            >
+                              Edit
+                            </button>
+                          </div>
+                        </div>
+                      ))}
                   </div>
                 )}
 
-                {!entries[selectedDate] && (
+                {(!entries[selectedDate] || entries[selectedDate].length === 0) && (
                   <div className="mt-6 p-6 bg-gradient-to-br from-pink-50 to-purple-50 rounded-2xl border-2 border-dashed border-pink-300 text-center">
                     <p className="text-purple-600 font-medium mb-4">No entry yet for {selectedDate} ✨</p>
                     <button
